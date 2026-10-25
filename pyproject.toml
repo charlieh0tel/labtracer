@@ -1,0 +1,16 @@
+[project]
+name = "labtracer"
+version = "0.1.0"
+description = "Serial driver for Jeio Tech oven controllers"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5"]
+
+[project.scripts]
+labtracer-oven = "labtracer.oven:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
