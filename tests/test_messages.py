@@ -2,7 +2,7 @@ import pytest
 
 from labtracer import messages
 
-# Frames captured from a controller.
+# Example frames from third_party/Lab_Tracer_Commands.pdf, section 5.
 GRAPH_FRAME = (
     b"\x00\xaa\x01\xaa"
     b"\x2a"

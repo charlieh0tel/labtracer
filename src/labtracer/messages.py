@@ -1,4 +1,6 @@
-"""Wire format for the Jeio Tech oven controller's serial protocol.
+"""Wire format for the Jeio Tech LabTracer serial protocol.
+
+See third_party/Lab_Tracer_Commands.pdf.
 
 Every frame is a big-endian prolog (header, length, extension, command),
 `length` bytes of data, and a 16-bit checksum that is the sum of all
@@ -86,6 +88,8 @@ assert _Ack.size == 1
 def MakeAck(toggle_stopstart: bool = False) -> bytes:
     extension = 1 if toggle_stopstart else 0
     prolog = _MakeProlog(_Ack.size, extension, Command.Ack)
+    # The manual (section 5.3) gives 0xFD for "informing Run or Stop"; 0x7F
+    # is what this driver has always sent.  Unconfirmed on hardware.
     toggle = 0x7F if toggle_stopstart else 0xFF
     data = _Ack.pack(toggle)
     return _AppendChecksum(prolog + data)
@@ -107,7 +111,7 @@ _Graph = struct.Struct(
     "h"  # pv value (100ths C, 2's complement)
     "L"  # pv reserved = 0
     "B"  # heat instance = 1
-    "H"  # heat value
+    "h"  # heat value (100ths %, 2's complement)
     "L"  # heat reserved = 0
     "B"  # reserved a instance = 2
     "H"  # reserved a value
@@ -167,8 +171,8 @@ _Status = struct.Struct(
     "B"  # run data
     "B"  # autotune instance
     "B"  # autotune data
-    "B"  # status instance
-    "B"  # status data
+    "B"  # program run instance
+    "B"  # program run data
     "B"  # overtemp instance
     "B"  # overtemp data
     "B"  # water level instance
@@ -193,8 +197,8 @@ _StatusTuple = collections.namedtuple(
         "run_data",
         "autotune_instance",
         "autotune_data",
-        "status_instance",
-        "status_data",
+        "program_run_instance",
+        "program_run_data",
         "overtemp_instance",
         "overtemp_data",
         "water_level_instance",
@@ -217,7 +221,7 @@ def DecodeStatusData(b: bytes) -> dict:
     # Make sure these come in the expected order.
     _CheckInstance("run", s.run_instance, 4)
     _CheckInstance("autotune", s.autotune_instance, 5)
-    _CheckInstance("status", s.status_instance, 6)
+    _CheckInstance("program run", s.program_run_instance, 6)
     _CheckInstance("overtemp", s.overtemp_instance, 7)
     _CheckInstance("water level", s.water_level_instance, 8)
     _CheckInstance("cooler", s.cooler_instance, 9)
@@ -245,7 +249,7 @@ _Parameter = struct.Struct(
     "B"  # sv instance
     "l"  # sv value (100ths C, 2's complement)
     "B"  # heat instance
-    "L"  # heat value
+    "l"  # heat value (100ths %, 2's complement)
     "B"  # runtime instance
     "L"  # runtime value
     "B"  # on time count instance
