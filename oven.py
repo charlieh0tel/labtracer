@@ -158,9 +158,9 @@ class Oven:
                             if self.GetRunning() == new_running:
                                 logging.info(f"Stove now in {self._OnOff(new_running)} state")
                                 break
-                            time.sleep(0.25)
+                            time.sleep(0.100)
                     self._UpdatingCommsCycle(maybe_new_setpoint_C)
-                    time.sleep(0.25)
+                    time.sleep(0.100)
             finally:                    
                 if self.GetRunning():
                     logging.info("Stove is still running; turning it off.")
@@ -184,12 +184,13 @@ def main(argv):
 
     port = serial.Serial(argv[1], baudrate=19200)
 
-    def DelayPrintingValues(oven, howlong: float, interval: float = 1.):
+    def DelayPrintingValues(oven, howlong: float, interval: float = 0.5):
         now = time.time()
         while time.time() - now < howlong:
             print(f"{oven.GetCurrentSetpointValueC():.3f} C, "
                   f"{oven.GetCurrentProcessValueC():.3f} C, "
-                  f"{oven.GetCurrentHeaterDutyCyclePercent():5.1f} %")
+                  f"{oven.GetCurrentHeaterDutyCyclePercent():5.1f} %, "
+                  f"{'on' if oven.GetRunning() else 'off'}")
             time.sleep(interval)
 
     with Oven(port) as oven:
