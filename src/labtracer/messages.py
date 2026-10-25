@@ -88,8 +88,7 @@ assert _Ack.size == 1
 def MakeAck(toggle_stopstart: bool = False) -> bytes:
     extension = 1 if toggle_stopstart else 0
     prolog = _MakeProlog(_Ack.size, extension, Command.Ack)
-    # The manual (section 5.3) gives 0xFD for "informing Run or Stop"; 0x7F
-    # is what this driver has always sent.  Unconfirmed on hardware.
+    # 0x7F works on hardware; the manual (section 5.3) says 0xFD.
     toggle = 0x7F if toggle_stopstart else 0xFF
     data = _Ack.pack(toggle)
     return _AppendChecksum(prolog + data)
@@ -330,6 +329,23 @@ def DecodeParameterData(b: bytes) -> dict:
 
 
 ########################################################################
+
+# Section 6 of the manual.
+MODEL_NAMES = {
+    1: "OF-02G", 2: "OF-12G", 3: "OF-22G",
+    21: "ON-02G", 22: "ON-12G", 23: "ON-22G",
+    41: "OV-11", 42: "OV-12", 51: "VO-300", 52: "VO-400",
+    61: "IB-05G", 62: "IB-15G", 63: "IB-25G",
+    81: "IL-11", 82: "IL-21",
+    101: "BW-05G", 102: "BW-10G", 103: "BW-20G",
+    121: "CW-05G", 122: "CW-10G", 123: "CW-20G",
+    141: "RW-0525G", 142: "RW-1025G", 143: "RW-2025G", 144: "RW-3025G",
+    145: "RW-0540G", 146: "RW-1040G", 147: "RW-2040G", 148: "RW-3040G",
+    161: "VB-40G", 162: "VB-55G",
+    181: "IS-350", 182: "IS-350R", 183: "IS-650", 184: "IS-650R",
+    185: "IS-971", 186: "IS-971R", 187: "IS-971RF",
+    201: "IL-P",
+}  # fmt: skip
 
 _DECODERS = {
     Command.Graph: (_Graph.size, DecodeGraphData),

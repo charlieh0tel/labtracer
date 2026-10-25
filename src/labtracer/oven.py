@@ -117,6 +117,10 @@ class Oven:
         with self._lock:
             return self._parameters
 
+    def GetModelName(self) -> str:
+        model = self.GetStatus()["model"]
+        return messages.MODEL_NAMES.get(model, f"unknown model {model}")
+
     def GetRunning(self) -> bool:
         return self.GetStatus()["run"]
 
@@ -245,6 +249,10 @@ class Oven:
                 setpoint_C = self._setpoint_C
                 want_running = self._on
             self._TryExchange(setpoint_C, want_running)
+            with self._lock:
+                if self._on and self._status["overtemp"]:
+                    logger.error("Oven reports overtemp; turning it off.")
+                    self._on = False
             time.sleep(_POLL_INTERVAL_S)
 
     def _Shutdown(self):
@@ -297,7 +305,7 @@ class Oven:
                 self._CheckThread()
                 if time.monotonic() > deadline:
                     raise TimeoutError("no response from oven controller")
-            logger.info("Comms established.")
+            logger.info(f"Comms established with {self.GetModelName()}.")
             established = True
         finally:
             # Also covers KeyboardInterrupt, which skips __exit__ here.

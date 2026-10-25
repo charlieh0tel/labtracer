@@ -52,6 +52,7 @@ so the driver is careful about when it sends one:
 - When the `with` block exits for any reason, including Ctrl-C, SIGTERM or
   an exception, the driver sets the setpoint to 0 °C and turns the oven
   off, then confirms it. A second Ctrl-C doesn't cut that short.
+- If the oven reports overtemp, the driver logs an error and turns it off.
 - If comms drop, the driver keeps retrying, and the getters raise
   `ConnectionError` instead of returning stale readings.
 

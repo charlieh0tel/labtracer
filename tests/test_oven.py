@@ -26,6 +26,7 @@ class FakeController:
         self.events = []  # ('setpoint', C) and ('toggle', run) in order
         self.setpoint_hundredths = 2500
         self.run = False
+        self.overtemp = False
         self.acks_left = 0
         self.dead = False
         self.corrupt_next = 0
@@ -48,7 +49,7 @@ class FakeController:
             self.reported_run = self.run
         data = messages._Status.pack(
             0, 0, 0xFC, 0, 0x64, 0, 0x29, 0,
-            4, int(self.reported_run), 5, 0, 6, 0, 7, 0, 8, 0, 9, 0,
+            4, int(self.reported_run), 5, 0, 6, 0, 7, int(self.overtemp), 8, 0, 9, 0,
         )  # fmt: skip
         return _Frame(messages.Command.Status, data)
 
@@ -193,6 +194,23 @@ def test_exit_with_toggle_unconfirmed_turns_off():
         WaitFor(lambda: port.run)
     assert not port.run
     assert port.events[-1] == ("toggle", False)
+
+
+def test_overtemp_turns_oven_off():
+    port = FakeController()
+    with oven.Oven(port) as o:
+        o.SetSetpointC(40.0)
+        o.SetOn(True)
+        WaitFor(o.GetRunning)
+        port.overtemp = True
+        WaitFor(lambda: not o.GetRunning())
+        time.sleep(0.1)
+        assert not port.run
+
+
+def test_model_name():
+    with oven.Oven(FakeController()) as o:
+        assert o.GetModelName() == "OV-11"
 
 
 def test_recovers_from_corrupt_frame():
