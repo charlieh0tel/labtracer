@@ -177,6 +177,14 @@ def test_unknown_command():
         Decode(bytes(frame))
 
 
+def test_bad_graph_instance():
+    frame = bytearray(GRAPH_FRAME[:-2])
+    frame[8 + 14] = 0x01  # pv instance
+    frame = messages._AppendChecksum(bytes(frame))
+    with pytest.raises(messages.ProtocolError, match="pv instance"):
+        Decode(frame)
+
+
 def test_bad_instance():
     frame = bytearray(STATUS_FRAME[:-2])
     frame[8 + 14] = 0x05  # run instance

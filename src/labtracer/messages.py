@@ -151,6 +151,9 @@ _GraphTuple = collections.namedtuple(
 
 def DecodeGraphData(b: bytes) -> dict:
     g = _GraphTuple._make(_Graph.unpack(b))
+    # Make sure these come in the expected order.
+    _CheckInstance("pv", g.pv_instance, 0)
+    _CheckInstance("heat", g.heat_instance, 1)
     return {
         "process_value_C": DecodeTempC(g.pv_value),
         "heat_value_percent": _DecodeHeatPercent(g.heat_value),
@@ -320,6 +323,8 @@ def DecodeParameterData(b: bytes) -> dict:
         "setpoint_C": DecodeTempC(p.sv_value),
         "heater_duty_cycle_percent": _DecodeHeatPercent(p.heat_value),
         "runtime_seconds": p.runtime_value,
+        # The manual doesn't give a scale; 0x176F in its example reads as
+        # 59.99 Hz in hundredths.
         "power_frequency_hz": p.power_frequency_value / 100.0,
     }
 

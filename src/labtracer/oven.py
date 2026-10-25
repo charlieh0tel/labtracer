@@ -335,7 +335,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             time.sleep(interval)
 
-    with serial.Serial(args.port, baudrate=19200) as port, Oven(port) as oven:
+    # 19200 baud, 8N1, per section 2 of the manual.
+    with (
+        serial.Serial(
+            args.port,
+            baudrate=19200,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+        ) as port,
+        Oven(port) as oven,
+    ):
         oven.SetSetpointC(40.0)
         oven.SetOn(True)
         DelayPrintingValues(oven, 10.0)
