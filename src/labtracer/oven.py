@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import signal
 import sys
 import threading
 import time
@@ -10,15 +11,23 @@ import serial
 
 from labtracer import messages
 
-# How long to wait for the controller to report a run/stop toggle.
+# How long a run/stop toggle may go unconfirmed before we complain.  We
+# never send a second toggle while one is unconfirmed: the protocol has no
+# explicit on/off, so a late-arriving status would make it flip back.
 _TOGGLE_TIMEOUT_S = 5.0
-# How many consecutive bad comms cycles before giving up.
+# Consecutive bad exchanges before getters report comms as lost.
 _MAX_CONSECUTIVE_ERRORS = 10
-# How long __enter__ waits for the first good comms cycle.
+# How long __enter__ waits for the first good exchanges.
 _COMMS_TIMEOUT_S = 15.0
+# How long shutdown keeps trying to confirm the oven is off.
+_SHUTDOWN_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.1
 
 logger = logging.getLogger(__name__)
+
+
+def _OnOff(v: bool) -> str:
+    return "on" if v else "off"
 
 
 class Oven:
@@ -29,11 +38,21 @@ class Oven:
         self._stop_event = threading.Event()
         self._comms_established = threading.Event()
         self._thread = None
+        # Requested state, set by the caller.
         self._setpoint_C = None
         self._on = False
+        # Latest readings from the controller.
         self._graph = None
         self._status = None
         self._parameters = None
+        # Comms thread bookkeeping.
+        self._sent_setpoint = None  # Last setpoint sent, in wire units.
+        self._warned_setpoint = None
+        self._toggle_expect = None  # Run state an unconfirmed toggle should give.
+        self._toggle_sent_at = None
+        self._toggle_warned = False
+        self._consecutive_errors = 0
+        self._comms_lost = False
 
     def _ReadControllerResponse(self, expected: messages.Command) -> dict:
         prolog = messages.DecodeProlog(self._port.read(messages.PROLOG_LENGTH))
@@ -47,30 +66,41 @@ class Oven:
 
     def SetSetpointC(self, setpoint_C: float):
         messages.EncodeTempC(setpoint_C)  # Raise now if out of range.
+        self._CheckThread()
         logger.info(f"Setting setpoint to {setpoint_C:.2f}")
         with self._lock:
             self._setpoint_C = setpoint_C
 
     def SetOn(self, on: bool):
-        logger.info(f"Setting oven to {self._OnOff(on)}")
+        """Requests the oven on or off.
+
+        The oven is only turned on once the controller reports the setpoint
+        given to SetSetpointC, so it never heats toward a stale one.
+        """
+        self._CheckThread()
+        logger.info(f"Setting oven to {_OnOff(on)}")
         with self._lock:
             self._on = on
+            if on and self._setpoint_C is None:
+                logger.warning("No setpoint set; oven will stay off until one is.")
 
     def Stop(self):
         logger.info("Stopping oven thread.")
         self._stop_event.set()
 
-    def _CheckAlive(self):
-        # Don't hand out stale readings once the comms thread has died.
-        if self._ThreadDied():
-            raise RuntimeError("oven thread failed; see log")
-
-    def _ThreadDied(self) -> bool:
-        return (
+    def _CheckThread(self):
+        if (
             self._thread is not None
             and not self._thread.is_alive()
             and not self._stop_event.is_set()
-        )
+        ):
+            raise RuntimeError("oven thread failed; see log")
+
+    def _CheckAlive(self):
+        # Don't hand out stale readings once comms are gone.
+        self._CheckThread()
+        if self._comms_lost:
+            raise ConnectionError("lost comms with oven controller")
 
     def GetStatus(self) -> dict:
         self._CheckAlive()
@@ -99,124 +129,172 @@ class Oven:
     def GetCurrentHeaterDutyCyclePercent(self) -> float:
         return self.GetParameters()["heater_duty_cycle_percent"]
 
-    def _CommsCycle(self, setpoint_C: float | None = None, toggle_onoff: bool = False):
+    def _ShouldToggle(
+        self, want_running: bool | None, setpoint_C: float | None, status, parameters
+    ) -> bool:
+        """Decides the run/stop toggle from this exchange's fresh readings."""
+        run = status["run"]
+        if self._toggle_expect is not None:
+            if run != self._toggle_expect:
+                elapsed = time.monotonic() - self._toggle_sent_at
+                if elapsed > _TOGGLE_TIMEOUT_S and not self._toggle_warned:
+                    logger.error(
+                        f"Oven has not turned {_OnOff(self._toggle_expect)} "
+                        f"{elapsed:.0f} s after the toggle; not toggling again."
+                    )
+                    self._toggle_warned = True
+                return False
+            logger.info(f"Oven now {_OnOff(run)}")
+            self._toggle_expect = None
+        if want_running is None or run == want_running:
+            return False
+        if not want_running:
+            return True
+        # Only start heating once the controller holds our setpoint.
+        return setpoint_C is not None and messages.EncodeTempC(
+            setpoint_C
+        ) == messages.EncodeTempC(parameters["setpoint_C"])
+
+    def _CheckSetpointTaken(self, setpoint_C: float, parameters):
+        encoded = messages.EncodeTempC(setpoint_C)
+        held = messages.EncodeTempC(parameters["setpoint_C"])
+        if held != encoded and self._warned_setpoint != encoded:
+            logger.warning(
+                f"Controller holds {parameters['setpoint_C']:.2f} C, "
+                f"not the {setpoint_C:.2f} C sent; out of range?"
+            )
+            self._warned_setpoint = encoded
+
+    def _Exchange(self, setpoint_C: float | None, want_running: bool | None):
         """One exchange: Update, then three responses each answered by an Ack.
 
-        A new setpoint goes out in the Update, ahead of any run/stop toggle in
-        the final Ack, so the oven never starts with a stale setpoint.
+        A changed setpoint goes out in the Update; a run/stop toggle, if any,
+        goes in the final Ack, decided from the Status read in this exchange.
         """
-        if setpoint_C is not None:
+        new_setpoint_C = None
+        if (
+            setpoint_C is not None
+            and messages.EncodeTempC(setpoint_C) != self._sent_setpoint
+        ):
+            new_setpoint_C = setpoint_C
             logger.info(f"Sending new setpoint {setpoint_C:.2f}")
-        try:
-            self._port.write(messages.MakeUpdate(setpoint_C))
-            graph = self._ReadControllerResponse(messages.Command.Graph)
-            self._port.write(messages.MakeAck())
-            status = self._ReadControllerResponse(messages.Command.Status)
-            self._port.write(messages.MakeAck())
-            parameters = self._ReadControllerResponse(messages.Command.Parameter)
-            if toggle_onoff:
-                logger.info("Sending oven on/off toggle")
-            self._port.write(messages.MakeAck(toggle_onoff))
-        except messages.ProtocolError:
-            # Drop whatever is left of the exchange so the next one starts clean.
-            time.sleep(self._port.timeout)
-            self._port.reset_input_buffer()
-            raise
+        self._port.write(messages.MakeUpdate(new_setpoint_C))
+        graph = self._ReadControllerResponse(messages.Command.Graph)
+        self._port.write(messages.MakeAck())
+        status = self._ReadControllerResponse(messages.Command.Status)
+        self._port.write(messages.MakeAck())
+        parameters = self._ReadControllerResponse(messages.Command.Parameter)
+        if new_setpoint_C is not None:
+            # The controller answered the Update, so it has the setpoint.
+            self._sent_setpoint = messages.EncodeTempC(new_setpoint_C)
+        elif setpoint_C is not None:
+            self._CheckSetpointTaken(setpoint_C, parameters)
+        toggle = self._ShouldToggle(want_running, setpoint_C, status, parameters)
+        if toggle:
+            logger.info(f"Sending toggle to turn oven {_OnOff(want_running)}")
+            # Mark it pending before writing: if the write fails partway the
+            # controller may still have acted on it.
+            self._toggle_expect = want_running
+            self._toggle_sent_at = time.monotonic()
+            self._toggle_warned = False
+        self._port.write(messages.MakeAck(toggle))
         with self._lock:
             self._graph = graph
             self._status = status
             self._parameters = parameters
 
-    def _RetryingCommsCycle(self, *args, **kwargs):
-        for attempt in range(1, _MAX_CONSECUTIVE_ERRORS + 1):
-            try:
-                return self._CommsCycle(*args, **kwargs)
-            except messages.ProtocolError as e:
-                logger.warning(f"Comms error (attempt {attempt}): {e}")
-        raise messages.ProtocolError(
-            f"giving up after {_MAX_CONSECUTIVE_ERRORS} consecutive comms errors"
-        )
+    def _TryExchange(
+        self, setpoint_C: float | None = None, want_running: bool | None = None
+    ) -> bool:
+        try:
+            self._Exchange(setpoint_C, want_running)
+        except (messages.ProtocolError, serial.SerialException) as e:
+            self._consecutive_errors += 1
+            logger.warning(f"Comms error ({self._consecutive_errors} in a row): {e}")
+            if (
+                self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS
+                and not self._comms_lost
+            ):
+                logger.error("Lost comms with oven controller; still retrying.")
+                self._comms_lost = True
+            # Let the rest of a broken exchange arrive, then drop it so the
+            # next one starts clean.
+            time.sleep(self._port.timeout)
+            if isinstance(e, messages.ProtocolError):
+                self._port.reset_input_buffer()
+            return False
+        if self._comms_lost:
+            logger.info("Comms with oven controller restored.")
+        self._consecutive_errors = 0
+        self._comms_lost = False
+        return True
 
-    @staticmethod
-    def _OnOff(v: bool):
-        return "on" if v else "off"
-
-    def _WaitForRunning(self, want_running: bool) -> bool:
-        deadline = time.monotonic() + _TOGGLE_TIMEOUT_S
-        while time.monotonic() < deadline:
-            self._RetryingCommsCycle()
-            if self.GetRunning() == want_running:
-                logger.info(f"Oven now {self._OnOff(want_running)}")
-                return True
-            time.sleep(_POLL_INTERVAL_S)
-        logger.warning(
-            f"Oven did not turn {self._OnOff(want_running)} "
-            f"within {_TOGGLE_TIMEOUT_S:.0f} s"
-        )
-        return False
+    def _Startup(self) -> bool:
+        # The first exchange after opening the port is discarded.
+        good = 0
+        while good < 2 and not self._stop_event.is_set():
+            if self._TryExchange():
+                good += 1
+                if good == 1:
+                    time.sleep(1.0)
+        return good == 2
 
     def _Loop(self):
         while not self._stop_event.is_set():
             with self._lock:
                 setpoint_C = self._setpoint_C
-                current_setpoint_C = self._parameters["setpoint_C"]
-                # Compare in wire units so a setpoint that isn't a whole
-                # number of hundredths doesn't get resent forever.
-                new_setpoint_C = (
-                    setpoint_C
-                    if setpoint_C is not None
-                    and messages.EncodeTempC(setpoint_C)
-                    != messages.EncodeTempC(current_setpoint_C)
-                    else None
-                )
                 want_running = self._on
-                needs_toggle = self._status["run"] != want_running
-            self._RetryingCommsCycle(new_setpoint_C, needs_toggle)
-            if needs_toggle:
-                # The toggle takes a moment to show up in the status.  If it
-                # never does, the next pass toggles again.
-                self._WaitForRunning(want_running)
+            self._TryExchange(setpoint_C, want_running)
             time.sleep(_POLL_INTERVAL_S)
 
-    def _TurnOff(self):
-        if not self.GetRunning():
-            return
-        logger.info("Oven is still running; turning it off.")
-        for _ in range(3):
-            self._RetryingCommsCycle(0.0, True)
-            if self._WaitForRunning(False):
+    def _Shutdown(self):
+        if self._status is None:
+            return  # Never heard from the controller, so never changed it.
+        deadline = time.monotonic() + _SHUTDOWN_TIMEOUT_S
+        while True:
+            if (
+                self._TryExchange()
+                and not self._status["run"]
+                and self._toggle_expect is None
+            ):
                 return
-        logger.error("Could not turn the oven off!")
+            if time.monotonic() > deadline:
+                break
+            logger.info("Oven may still be running; turning it off.")
+            # Setpoint 0 stops the heating even if the toggle goes astray.
+            self._TryExchange(0.0, False)
+            time.sleep(_POLL_INTERVAL_S)
+        logger.error("Could not confirm the oven is off!")
 
     def _Thread(self):
-        # An exception here ends the thread and is reported to stderr by
-        # threading.excepthook; _ThreadDied() then tells the caller.
-        # The first exchange after opening the port is discarded.
-        self._RetryingCommsCycle()
-        time.sleep(1.0)
-        self._RetryingCommsCycle()
-        self._comms_established.set()
         try:
-            self._Loop()
+            if self._Startup():
+                self._comms_established.set()
+                self._Loop()
         finally:
-            self._TurnOff()
+            self._Shutdown()
 
     def Start(self):
         self._thread = threading.Thread(target=self._Thread, name="oven")
         self._thread.start()
 
     def Join(self):
-        if self._thread is not None:
-            self._thread.join()
+        # Shutdown is bounded, and abandoning it could leave the oven heating,
+        # so a second Ctrl-C doesn't cut it short.
+        while self._thread is not None and self._thread.is_alive():
+            try:
+                self._thread.join()
+            except KeyboardInterrupt:
+                logger.warning("Still turning the oven off; please wait.")
 
     def __enter__(self):
-        self.Start()
         established = False
         try:
+            self.Start()
             logger.info("Waiting for comms...")
             deadline = time.monotonic() + _COMMS_TIMEOUT_S
             while not self._comms_established.wait(_POLL_INTERVAL_S):
-                self._CheckAlive()
+                self._CheckThread()
                 if time.monotonic() > deadline:
                     raise TimeoutError("no response from oven controller")
             logger.info("Comms established.")
@@ -238,6 +316,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("port", help="serial device, e.g. /dev/ttyUSB0")
     args = parser.parse_args(argv)
 
+    # Make SIGTERM and SIGHUP unwind like Ctrl-C so the oven gets turned off.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    signal.signal(signal.SIGHUP, signal.default_int_handler)
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
@@ -249,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{oven.GetCurrentSetpointValueC():.2f} C, "
                 f"{oven.GetCurrentProcessValueC():.2f} C, "
                 f"{oven.GetCurrentHeaterDutyCyclePercent():5.1f} %, "
-                f"{Oven._OnOff(oven.GetRunning())}"
+                f"{_OnOff(oven.GetRunning())}"
             )
             time.sleep(interval)
 
